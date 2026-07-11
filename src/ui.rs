@@ -28,8 +28,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let complete = summary.done > 0 && !app.in_flight();
 
     let advisory = ttl_advisory(app, &summary, complete);
+    // The header grows one row for the ECS line, only when --ecs/config set
+    // subnets up — an ECS-less run renders exactly as before.
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(if app.ecs_list.is_empty() { 4 } else { 5 }),
         Constraint::Min(6),
         Constraint::Length(if advisory.is_some() { 3 } else { 2 }),
     ])
@@ -132,16 +134,36 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         });
         types.push(Span::raw(" "));
     }
+    let mut lines = vec![input, Line::from(types)];
+    // Active client subnet on its own line, only when --ecs/config set one
+    // up — an ECS-less run renders exactly as before (the header layout in
+    // `draw` reserves the extra row on the same condition).
+    if !app.ecs_list.is_empty() {
+        let mut ecs = vec![Span::styled(" ECS:    ", th.muted.style())];
+        match app.ecs_sel {
+            Some(i) => {
+                ecs.push(Span::styled(
+                    format!(" {} ", crate::dns::fmt_ecs(&app.ecs_list[i])),
+                    Style::new().fg(Color::Black).bg(th.accent).bold(),
+                ));
+                if app.ecs_list.len() > 1 {
+                    ecs.push(Span::styled(
+                        format!(" {}/{}", i + 1, app.ecs_list.len()),
+                        th.muted.style(),
+                    ));
+                }
+            }
+            None => ecs.push(Span::styled(" off ", th.muted.style())),
+        }
+        lines.push(Line::from(ecs));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(th.accent))
         .title(" 🌍 DNS Propagation Checker ")
         .title_style(Style::new().bold());
-    frame.render_widget(
-        Paragraph::new(vec![input, Line::from(types)]).block(block),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_gauge(frame: &mut Frame, app: &App, summary: &Summary, area: Rect) {
@@ -189,6 +211,9 @@ fn draw_gauge(frame: &mut Frame, app: &App, summary: &Summary, area: Rect) {
         }
         if summary.errors > 0 {
             label.push_str(&format!(" · {} unreachable", summary.errors));
+        }
+        if summary.ecs_blind > 0 {
+            label.push_str(&format!(" · {} no-ecs", summary.ecs_blind));
         }
         // Worst case, every disagreeing cache must refetch within this — the
         // number the whole watch is really about.
@@ -253,7 +278,10 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
                     Cell::from(""),
                 ),
                 RowState::Done {
-                    result, elapsed, ..
+                    result,
+                    elapsed,
+                    ecs_honored,
+                    ..
                 } => {
                     let ms = elapsed.as_millis();
                     let time_style = if ms < 100 {
@@ -264,25 +292,33 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
                         Style::new().fg(th.error)
                     };
                     let time = Cell::from(Span::styled(format!("{ms}ms"), time_style));
+                    // Answered without using the round's ECS option: its own
+                    // vantage point's answer, excluded from the propagation
+                    // math, so agree/differ verdicts don't apply to it.
+                    let ecs_ignored = *ecs_honored == Some(false);
                     match result {
                         QueryResult::Records { values, min_ttl } => {
                             let matches_majority = !complete || summary.majority_rows[i];
-                            let verdict = if matches_majority {
+                            let verdict = if matches_majority || ecs_ignored {
                                 None
                             } else {
                                 app.ttl_verdict(i, now)
                             };
-                            let (status, style) = match verdict {
-                                Some(TtlVerdict::PastTtl) => {
-                                    ("! PAST TTL", Style::new().fg(th.stale).bold())
+                            let (status, style) = if ecs_ignored {
+                                ("◌ NO ECS", th.muted.style())
+                            } else {
+                                match verdict {
+                                    Some(TtlVerdict::PastTtl) => {
+                                        ("! PAST TTL", Style::new().fg(th.stale).bold())
+                                    }
+                                    Some(TtlVerdict::Upstream) => {
+                                        ("↻ UPSTREAM", Style::new().fg(th.upstream).bold())
+                                    }
+                                    None if matches_majority => {
+                                        ("✓ OK", Style::new().fg(th.agree).bold())
+                                    }
+                                    None => ("≠ DIFFERS", Style::new().fg(th.differ).bold()),
                                 }
-                                Some(TtlVerdict::Upstream) => {
-                                    ("↻ UPSTREAM", Style::new().fg(th.upstream).bold())
-                                }
-                                None if matches_majority => {
-                                    ("✓ OK", Style::new().fg(th.agree).bold())
-                                }
-                                None => ("≠ DIFFERS", Style::new().fg(th.differ).bold()),
                             };
                             // Live countdown to the moment this cache entry
                             // must be refetched. For disagreeing rows this is
@@ -291,7 +327,7 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
                             let remaining = state.remaining_ttl(now).unwrap_or_default().as_secs();
                             let exp = if remaining == 0 {
                                 Span::styled("expired", th.muted.style().italic())
-                            } else if matches_majority {
+                            } else if matches_majority || ecs_ignored {
                                 Span::styled(fmt_secs(remaining), th.muted.style())
                             } else {
                                 Span::styled(fmt_secs(remaining), style)
@@ -303,7 +339,7 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
                                 Cell::from(Span::styled(status, style)),
                                 Cell::from(Span::styled(
                                     values.join(", "),
-                                    if matches_majority {
+                                    if matches_majority || ecs_ignored {
                                         Style::new()
                                     } else {
                                         Style::new().fg(style.fg.unwrap_or(th.differ))
@@ -311,13 +347,27 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
                                 )),
                             )
                         }
-                        QueryResult::NoRecords(code) => (
-                            time,
-                            Cell::from(""),
-                            Cell::from(""),
-                            Cell::from(Span::styled("∅ NONE", Style::new().fg(th.error).bold())),
-                            Cell::from(Span::styled(code.clone(), Style::new().fg(th.error))),
-                        ),
+                        QueryResult::NoRecords(code) => {
+                            let (status, style) = if ecs_ignored {
+                                ("◌ NO ECS", th.muted.style())
+                            } else {
+                                ("∅ NONE", Style::new().fg(th.error).bold())
+                            };
+                            (
+                                time,
+                                Cell::from(""),
+                                Cell::from(""),
+                                Cell::from(Span::styled(status, style)),
+                                Cell::from(Span::styled(
+                                    code.clone(),
+                                    if ecs_ignored {
+                                        th.muted.style()
+                                    } else {
+                                        Style::new().fg(th.error)
+                                    },
+                                )),
+                            )
+                        }
                         QueryResult::ServFail => (
                             time,
                             Cell::from(""),
@@ -506,6 +556,13 @@ fn draw_map(
                     // the whole muted style instead of an fg like the rest.
                     RowState::Idle => th.muted.style(),
                     RowState::Pending => Style::new().fg(th.pending),
+                    // ECS-ignoring resolvers answered a different question
+                    // than the probed subnet: muted like idle, not judged.
+                    RowState::Done {
+                        result: QueryResult::Records { .. } | QueryResult::NoRecords(_),
+                        ecs_honored: Some(false),
+                        ..
+                    } => th.muted.style(),
                     RowState::Done { result, .. } => Style::new().fg(match result {
                         QueryResult::Records { .. } => {
                             if !complete || summary.majority_rows[i] {
@@ -534,14 +591,18 @@ fn draw_map_info(frame: &mut Frame, app: &App, summary: &Summary, complete: bool
         return;
     }
     let th = theme::active();
-    let mut lines = vec![Line::from(vec![
+    let mut legend = vec![
         Span::styled("● agrees  ", Style::new().fg(th.agree)),
         Span::styled("● differs  ", Style::new().fg(th.differ)),
         Span::styled("● past-ttl  ", Style::new().fg(th.stale)),
         Span::styled("● upstream  ", Style::new().fg(th.upstream)),
         Span::styled("● error  ", Style::new().fg(th.error)),
         Span::styled("● pending", Style::new().fg(th.pending)),
-    ])];
+    ];
+    if !app.ecs_list.is_empty() {
+        legend.push(Span::styled("  ● no-ecs", th.muted.style()));
+    }
+    let mut lines = vec![Line::from(legend)];
     if complete && !summary.majority_values.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -585,9 +646,15 @@ fn draw_footer(
 ) {
     let th = theme::active();
     let mut status = Line::default();
-    if let Some((domain, rtype)) = &app.queried {
+    if let Some((domain, rtype, ecs)) = &app.queried {
+        // Name the round's subnet: cycling the selection doesn't re-query,
+        // so the table may show a different subnet than the header chip.
+        let ecs = match ecs {
+            Some(subnet) => format!(" ecs {}", crate::dns::fmt_ecs(subnet)),
+            None => String::new(),
+        };
         status.push_span(Span::styled(
-            format!(" {domain} {rtype}: "),
+            format!(" {domain} {rtype}{ecs}: "),
             Style::new().bold(),
         ));
         status.push_span(Span::styled(
@@ -618,9 +685,23 @@ fn draw_footer(
                 th.muted.style()
             },
         ));
+        if summary.ecs_blind > 0 {
+            status.push_span(Span::raw(" · "));
+            status.push_span(Span::styled(
+                format!("{} no-ecs", summary.ecs_blind),
+                th.muted.style(),
+            ));
+        }
     }
+    let ecs_hint = if app.ecs_list.is_empty() {
+        ""
+    } else {
+        " · Ctrl+N ecs"
+    };
     let keys = Line::from(Span::styled(
-        " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Ctrl+O globe/map · Tab record type · ↑/↓ scroll · Esc quit",
+        format!(
+            " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Ctrl+O globe/map · Tab record type{ecs_hint} · ↑/↓ scroll · Esc quit"
+        ),
         th.muted.style(),
     ));
     if let Some(advisory) = advisory {
