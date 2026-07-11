@@ -1,9 +1,11 @@
 mod app;
 mod config;
 mod dns;
+mod globe;
 mod resolvers;
 mod sites;
 mod ui;
+mod world_data;
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -26,6 +28,7 @@ Configuration:
   is missing), else $XDG_CONFIG_HOME/dnsglobe/config.toml, else
   ~/.config/dnsglobe/config.toml.
 
+  # view = \"globe\"       # map panel style: auto (default) | map | globe
   # replace = true       # use only the resolvers below, drop the built-ins
   [[resolvers]]
   name = \"Corp DNS\"      # required
@@ -54,6 +57,11 @@ struct Cli {
     /// Run a single check, print a plain-text table, and exit (no TTY needed)
     #[arg(long, requires = "domain")]
     once: bool,
+
+    /// Map panel style: auto picks the globe on narrow terminals and the
+    /// flat map on wide ones [overrides the config file's `view`]
+    #[arg(long, value_enum)]
+    view: Option<app::ViewMode>,
 }
 
 fn parse_record_type(s: &str) -> Result<RecordType, String> {
@@ -75,7 +83,9 @@ async fn main() -> Result<()> {
 
     // Fail on a broken config before the terminal enters raw mode, so the
     // error prints normally.
-    resolvers::init(config::load()?);
+    let settings = config::load()?;
+    let view = cli.view.or(settings.view).unwrap_or_default();
+    resolvers::init(settings.resolvers);
 
     // `--once` runs a single check and prints plain text — handy for scripts
     // and for testing without a TTY.
@@ -97,7 +107,13 @@ async fn main() -> Result<()> {
             )
         );
     }
-    let result = run_tui(terminal, cli.domain.unwrap_or_default(), cli.record_type).await;
+    let result = run_tui(
+        terminal,
+        cli.domain.unwrap_or_default(),
+        cli.record_type,
+        view,
+    )
+    .await;
     if enhanced_keys {
         let _ = crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
     }
@@ -109,9 +125,11 @@ async fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     initial_domain: String,
     initial_rtype: Option<RecordType>,
+    view: app::ViewMode,
 ) -> Result<()> {
     let auto_query = !initial_domain.is_empty();
     let mut app = App::new(initial_domain);
+    app.view_mode = view;
     if let Some(rtype) = initial_rtype {
         app.rtype_idx = app::RECORD_TYPES
             .iter()
@@ -205,6 +223,11 @@ fn handle_key(
         }
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.sort = app.sort.next();
+        }
+        // Ctrl+O: "O" is the globe. Ctrl+G would be the natural mnemonic but
+        // it's the BEL character, which some terminal setups intercept.
+        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_globe();
         }
         KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
             if app.auto_refresh || app.next_poll.is_some() {

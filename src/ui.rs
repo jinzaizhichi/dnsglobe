@@ -4,32 +4,30 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Map, MapResolution};
+use ratatui::widgets::canvas::{Canvas, Map, MapResolution, Painter, Shape};
 use ratatui::widgets::{Block, Borders, Cell, LineGauge, Paragraph, Row, Table, TableState};
 
 use crate::app::{
     ADVISORY_TTL, App, RECORD_TYPES, RowState, SPINNER, Summary, TtlVerdict, fmt_secs,
 };
 use crate::dns::QueryResult;
-use crate::resolvers;
+use crate::{globe, resolvers, world_data};
 
 const ACCENT: Color = Color::Cyan;
-/// Table needs ~103 cols; only show the map when there's room for both.
+/// Table needs ~103 cols; only show the flat map when there's room for both.
 const MIN_WIDTH_FOR_MAP: u16 = 157;
+/// The square-ish globe panel stays legible much narrower than the flat map,
+/// so it appears on terminals the flat map would have left map-less.
+const MIN_WIDTH_FOR_GLOBE: u16 = TABLE_WIDTH + 28;
 const TABLE_WIDTH: u16 = 103;
 /// Dot/status color for a cache serving an answer past its own TTL.
 const STALE_COLOR: Color = Color::LightRed;
 /// Dot/status color for "refetched but upstream still serves the old data".
 const UPSTREAM_COLOR: Color = Color::LightBlue;
-const MAP_MAX_WIDTH: u16 = 170;
-/// Map bounds: lon −170..180, lat −55..72 (poles cropped).
-const MAP_LON_SPAN: f64 = 350.0;
-const MAP_LAT_SPAN: f64 = 127.0;
-/// Rows per column that keep the projection square: braille dots are ~square
-/// in a 1:2 terminal font, and a cell is 2 dots wide × 4 tall, so
-/// rows = cols × (lat/lon span) × 2/4. Sizing the map by this instead of
-/// filling available height is what keeps the continents recognizable.
-const MAP_ASPECT: f64 = MAP_LAT_SPAN / MAP_LON_SPAN * 2.0 / 4.0;
+/// Globe graticule and limb: dimmer than the DarkGray coastline so the
+/// continents stay in front. Indexed so it degrades to something readable on
+/// 256-color terminals; true 8-color ones will approximate.
+const GRID_COLOR: Color = Color::Indexed(238);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let summary = app.summary();
@@ -47,10 +45,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_header(frame, app, header);
 
-    let (left, right) = if body.width >= MIN_WIDTH_FOR_MAP {
-        let map_width = (body.width - TABLE_WIDTH).min(MAP_MAX_WIDTH);
+    // Steer the view for this width (auto mode flips at a threshold; forced
+    // and pinned modes hold), then size the panel at the morph's current
+    // position so the panel reshapes along with the projection.
+    app.sync_view(body.width);
+    let geom = globe::panel_geometry(
+        body.width.saturating_sub(TABLE_WIDTH),
+        body.height,
+        app.globe.t(Instant::now()),
+    );
+    let min_width = if app.globe.target() {
+        MIN_WIDTH_FOR_GLOBE
+    } else {
+        MIN_WIDTH_FOR_MAP
+    };
+    let (left, right) = if body.width >= min_width {
         let [left, right] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(map_width)]).areas(body);
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(geom.width)]).areas(body);
         (left, Some(right))
     } else {
         (body, None)
@@ -65,14 +76,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .min(resolvers::active().len().saturating_sub(visible));
     draw_table(frame, app, &summary, complete, table);
     if let Some(right) = right {
-        // Height follows from width via the aspect ratio; leftover space
-        // below the map shows the majority answer in full.
-        let map_height = ((f64::from(right.width.saturating_sub(2)) * MAP_ASPECT).round() as u16)
-            .saturating_add(2)
-            .min(right.height);
+        // Leftover space below the map shows the majority answer in full.
         let [map_area, info_area] =
-            Layout::vertical([Constraint::Length(map_height), Constraint::Fill(1)]).areas(right);
-        draw_map(frame, app, &summary, complete, map_area);
+            Layout::vertical([Constraint::Length(geom.height), Constraint::Fill(1)]).areas(right);
+        draw_map(frame, app, &summary, complete, &geom, map_area);
         draw_map_info(frame, app, &summary, complete, info_area);
     }
     draw_footer(frame, app, &summary, advisory, footer);
@@ -384,27 +391,104 @@ fn draw_table(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, a
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_map(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, area: Rect) {
+/// The world mid-morph: coastline points run through the flat↔globe
+/// projection at parameter `t`, plus a graticule and the limb once the
+/// sphere has (mostly) formed. Painted point-by-point like ratatui's `Map` —
+/// at t=0 it would be pixel-identical to it, so `draw_map` swaps back to the
+/// built-in shape there.
+struct MorphedWorld {
+    t: f64,
+    center_lon: f64,
+}
+
+impl MorphedWorld {
+    fn paint(&self, painter: &mut Painter, lon: f64, lat: f64, color: Color) {
+        if let Some((x, y)) = globe::project(lon, lat, self.center_lon, self.t)
+            && let Some((px, py)) = painter.get_point(x, y)
+        {
+            painter.paint(px, py, color);
+        }
+    }
+}
+
+impl Shape for MorphedWorld {
+    fn draw(&self, painter: &mut Painter) {
+        // Graticule first so land overdraws it. It carries the spin where
+        // there's no coastline (the Pacific hemisphere is nearly all water)
+        // and, mid-morph, shows the map's grid curling into a sphere.
+        for meridian in (-180..180).step_by(30) {
+            for lat in (-80..=80).step_by(2) {
+                self.paint(painter, f64::from(meridian), f64::from(lat), GRID_COLOR);
+            }
+        }
+        for parallel in (-60..=60).step_by(30) {
+            for lon in (-180..180).step_by(2) {
+                self.paint(painter, f64::from(lon), f64::from(parallel), GRID_COLOR);
+            }
+        }
+        // The limb only exists on the sphere — fade it in near the end of
+        // the morph instead of drawing a floating circle over the flat map.
+        if self.t > 0.9 {
+            for step in 0..360 {
+                let a = f64::from(step).to_radians();
+                if let Some((px, py)) = painter.get_point(
+                    globe::CENTER_X + globe::RADIUS * a.cos(),
+                    globe::CENTER_Y + globe::RADIUS * a.sin(),
+                ) {
+                    painter.paint(px, py, GRID_COLOR);
+                }
+            }
+        }
+        for &(lon, lat) in &world_data::WORLD {
+            self.paint(painter, lon, lat, Color::DarkGray);
+        }
+    }
+}
+
+fn draw_map(
+    frame: &mut Frame,
+    app: &App,
+    summary: &Summary,
+    complete: bool,
+    geom: &globe::PanelGeom,
+    area: Rect,
+) {
+    let now = Instant::now();
+    // Layout and projection share geom.t so the zoom tracks the morph.
+    let t = geom.t;
+    let center_lon = app.globe.center_lon(now);
     let canvas = Canvas::default()
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(Color::DarkGray))
-                .title(" Resolver Map ")
+                .title(if t > 0.5 {
+                    " Resolver Globe "
+                } else {
+                    " Resolver Map "
+                })
                 .title_style(Style::new().fg(ACCENT).bold()),
         )
-        .x_bounds([-170.0, 180.0])
-        .y_bounds([-55.0, 72.0])
+        .x_bounds(geom.x_bounds())
+        .y_bounds(geom.y_bounds())
         .paint(|ctx| {
-            ctx.draw(&Map {
-                color: Color::DarkGray,
-                resolution: MapResolution::High,
-            });
-            let now = Instant::now();
+            if t > 0.0 {
+                ctx.draw(&MorphedWorld { t, center_lon });
+            } else {
+                ctx.draw(&Map {
+                    color: Color::DarkGray,
+                    resolution: MapResolution::High,
+                });
+            }
             for (i, state) in app.rows.iter().enumerate() {
                 // Discovered anycast site position when known, else the
                 // configured one; None keeps the resolver off the map.
                 let Some((lat, lon)) = app.effective_coords(i) else {
+                    continue;
+                };
+                // Same morph as the coastline, so dots ride their continents;
+                // None = rotated onto the far hemisphere.
+                let Some((x, y)) = globe::project(lon, lat, center_lon, t) else {
                     continue;
                 };
                 let color = match state {
@@ -427,7 +511,7 @@ fn draw_map(frame: &mut Frame, app: &App, summary: &Summary, complete: bool, are
                         | QueryResult::Error(_) => Color::Red,
                     },
                 };
-                ctx.print(lon, lat, Span::styled("●", Style::new().fg(color).bold()));
+                ctx.print(x, y, Span::styled("●", Style::new().fg(color).bold()));
             }
         });
     frame.render_widget(canvas, area);
@@ -522,7 +606,7 @@ fn draw_footer(
         ));
     }
     let keys = Line::from(Span::styled(
-        " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Tab record type · ↑/↓ scroll · Esc quit",
+        " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Ctrl+O globe/map · Tab record type · ↑/↓ scroll · Esc quit",
         Style::new().fg(Color::DarkGray),
     ));
     if let Some(advisory) = advisory {
